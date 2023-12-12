@@ -3,7 +3,7 @@ import ccxt.pro as ccxt
 from decouple import config
 import time
 
-from trade import Trade
+from trade import Order
 from trigger import Trigger
 
 
@@ -26,7 +26,7 @@ trigger = Trigger(
     direction=TRADE_DIRECTION,
     exchange=exchange,
 )
-trade = Trade(trigger=trigger)
+trade = Order(trigger=trigger)
 
 
 async def main():
@@ -39,6 +39,7 @@ async def main():
         price = orderbook[orderbook_focus][0][0]
         trigger.check_for_trigger(price)
 
+        # print changing orderbook for fun
         if ask_price != orderbook["asks"][0][0] or bid_price != orderbook["bids"][0][0]:
             print(
                 f'''{"{:.2f}".format(round(orderbook["asks"][0][0], 1))}\t{"{:.2f}".format(
@@ -50,12 +51,14 @@ async def main():
         bid_price = orderbook["bids"][0][0]
 
         if trigger.triggered:
-            trade = Trade(trigger=trigger)
+            trade = Order(trigger=trigger)
 
+    # put in a delay before putting in a trade
     while not trigger.enough_delay(seconds=SECONDS_DELAY):
         print("sleep...")
         time.sleep(1)
 
+    # TODO: adjust order with code from testing.py
     while not trade.is_live:
         orderbook = await exchange.watch_order_book(TICKER)
         price = orderbook[orderbook_focus][0][0]
