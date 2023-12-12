@@ -8,9 +8,11 @@ import ccxt
 class Trigger:
     """Initial POI (trigger) for possible scalp"""
 
+    ticker: str
     price: float
     direction: str
     exchange: ccxt.bybit
+    trading_size: float
 
     triggered: bool = False
     finished: bool = False

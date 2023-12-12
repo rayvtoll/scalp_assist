@@ -55,8 +55,8 @@ Target_Coin_Symbol = "BTCUSDT"
 # printer("edit_order", edit_order)
 
 """Get position"""
-fetch_position = exchange.fetch_position(symbol="BTCUSDT")
-printer("fetch_positions", fetch_position)
+# fetch_position = exchange.fetch_position(symbol="BTCUSDT")
+# printer("fetch_positions", fetch_position)
 
 """Edit position"""
 # async def main():
@@ -65,3 +65,12 @@ printer("fetch_positions", fetch_position)
 #         print(edit_position)
 
 # run(main())
+
+"""Cancel order"""
+# exchange.cancel_all_orders("BTCUSDT")
+
+import sys
+def print_there(x, y, text):
+     sys.stdout.write("\x1b7\x1b[%d;%df%s\x1b8" % (x, y, text))
+     sys.stdout.flush()
+    
