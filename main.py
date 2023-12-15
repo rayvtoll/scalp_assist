@@ -1,19 +1,23 @@
 from asyncio import run
 import ccxt.pro as ccxt
 from decouple import config
-import sys
-import time
 
-from order import Order
-from trigger import Trigger
-from price import get_price
+from print_there import print_there
+from order import TriggerOrder
 
-# Trading variables
+# GLOBALS
 SECONDS_DELAY: int = 5
 TICKER: str = "BTCUSDT"
-TRIGGER_PRICE: float = 41320.9
+PRICE: float = 42180
 TRADE_DIRECTION: str = "short"
-ONE_PERCENT_TRADING_SIZE = 0.001
+ONE_PERCENT_TRADING_SIZE: float = 0.002
+ORDER_OFFSET: float = 0.00025
+TRIGGER_ORDER_PRICE = round(
+    PRICE * (1 - ORDER_OFFSET)
+    if TRADE_DIRECTION == "short"
+    else PRICE * (1 + ORDER_OFFSET),
+    1,
+)
 
 exchange = ccxt.bybit(
     config={
@@ -24,56 +28,55 @@ exchange = ccxt.bybit(
     }
 )
 
-trigger = Trigger(
-    ticker=TICKER,
-    price=TRIGGER_PRICE,
-    direction=TRADE_DIRECTION,
-    exchange=exchange,
-    trading_size=ONE_PERCENT_TRADING_SIZE,
-)
-orderbook_focus = "bids" if trigger.direction == "long" else "asks"
-
-
-def print_there(x, y, text):
-    sys.stdout.write("\x1b7\x1b[%d;%df%s\x1b8" % (x, y, text))
-    sys.stdout.flush()
-
-
 async def main():
-    price_focus: int = 0
+    trigger_order = TriggerOrder(
+        ticker=TICKER,
+        price=PRICE,
+        direction=TRADE_DIRECTION,
+        exchange=exchange,
+        trading_size=ONE_PERCENT_TRADING_SIZE,
+        trigger_order_price=TRIGGER_ORDER_PRICE,
+        order_offset=ORDER_OFFSET,
+    )
+    last_changed_price: int = 0
 
-    while not trigger.triggered:
-        price = await get_price(exchange, TICKER, orderbook_focus)
-        trigger.check_for_trigger(price)
+    while not trigger_order.triggered:
+        await trigger_order.set_current_price()
+        trigger_order.check_for_trigger(await trigger_order.current_price)
 
         # print changing orderbook for fun
-        if price_focus != price:
-            print_there(100, 00, f"""{"{:.1f}".format(round(price, 1))}""")
+        if last_changed_price != await trigger_order.current_price:
+            print_there(
+                100, 0, f"""currentprice: {await trigger_order.current_price}\t\ttriggerprice: {trigger_order.trigger_price}"""
+            )
 
-        price_focus = price
+        last_changed_price = await trigger_order.current_price
 
-        if trigger.triggered:
-            order = Order(trigger=trigger)
+    await trigger_order.create_order()
 
-    # put in a delay before putting in a order
-    while not trigger.enough_delay(seconds=SECONDS_DELAY):
-        print("sleep...")
-        time.sleep(1)
+    while not trigger_order.finished:
+        await trigger_order.set_order_variables()
+        print_there(
+            100,
+            0,
+            f"""currentprice: {await trigger_order.current_price}\t\torderprice: {trigger_order.trigger_order_price}\t\tamount: {await trigger_order.amount}\t\ttarget: {await trigger_order.target}\t\tstoploss: {await trigger_order.stop_loss}""",
+        )
 
-    await order.create(orderbook_focus)
+        if await trigger_order.did_stop_loss_change():
+            await trigger_order.update_order()
 
-    # # TODO: adjust order with code from testing.py
-    while not order.is_live:
-        price = await get_price(exchange, TICKER, orderbook_focus)
-        balance = await exchange.fetch_balance(params={"type": "unified"})
-        usdt_balance = balance.get("USDT", {})
-        await order.adjust_order(price, usdt_balance, SECONDS_DELAY)
-
-        if order.stop_loss_percentage > 0.01:
+        if await trigger_order.stop_loss_percentage > 0.01:
+            print()
             print("stop loss is too wide, cancelling order")
-            await order.cancel_order()
-            order.is_live = True
+            await trigger_order.cancel_order()
+            trigger_order.finished = True
+        
+        if await trigger_order.order_status != "open":
+            print()
+            print("Order status is no longer 'open'")
+            trigger_order.finished = True
 
+    print()
     await exchange.close()
 
 

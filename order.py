@@ -1,171 +1,219 @@
-from datetime import datetime, timedelta
-from typing import Tuple
+from datetime import datetime
+from functools import cached_property
 import ccxt
 from dataclasses import dataclass
-import json
-
-from trigger import Trigger
-from price import get_price
 
 
 @dataclass
-class Order:
+class TriggerOrder:
     """Holds all order data"""
 
-    trigger: Trigger
-    size: float | None = None
-    leverage: float | None = None
-    stop_loss: float | None = None
-    target: float | None = None
-    waiting_order: dict | None = None
-    is_live: bool = False
+    ticker: str
+    price: float
+    direction: str
+    exchange: ccxt.bybit
+    trading_size: float
+    trigger_order_price: float
+    order_offset: float
+    finished: bool = False
+    triggered: bool = False
+    trigger_order: dict | None = None
 
-    @property
-    def ticker(self) -> str:
-        return self.trigger.ticker
-
-    @property
-    def exchange(self) -> ccxt.bybit:
-        return self.trigger.exchange
-
-    @property
-    def price(self) -> float:
-        return self.trigger.price
-
-    @property
-    def direction(self) -> str:
-        return self.trigger.direction
-
-    @property
-    def trading_size(self) -> float:
-        return self.trigger.trading_size
-
-    async def create(self, orderbook_focus: str):
-        price: float = await get_price(self.exchange, self.ticker, orderbook_focus)
-        stop_loss, stoploss_percentage = self.set_stop_loss(price)
-        take_profit = self.set_take_profit(stoploss_percentage)
-
-        self.waiting_order = await self.exchange.create_order(
-            symbol=self.ticker,
-            type="market",
-            side="sell" if self.direction == "short" else "buy",
-            amount=self.set_size(),
-            params={
-                "positionIdx": "2" if self.direction == "short" else "1",
-                "triggerPrice": str(self.price),
-                "triggerDirection": "above" if self.direction == "long" else "below",
-                "stopLoss": {"triggerPrice": str(round(stop_loss, 1))},
-                "takeProfit": {"triggerPrice": str(round(take_profit, 1))},
-            },
+    @cached_property
+    def trigger_price(self) -> float:
+        return round(
+            self.price * (1 + self.order_offset)
+            if self.direction == "short"
+            else self.price * (1 - self.order_offset),
+            1,
         )
-        self.order_last_update = datetime.now()
-        print(json.dumps(self.waiting_order, indent=2))
 
-    async def adjust_order(self, price: float, balance: dict, delay: int) -> None:
-        """Adjust order on exchange"""
+    def check_for_trigger(self, price: float):
+        """See if price is at POI"""
 
-        self.get_balance(balance)
-        _, stop_loss_percentage = self.set_stop_loss(price)
-        self.set_take_profit(stop_loss_percentage)
-        self.set_size()
-        await self.update_order(delay)
+        if (self.direction == "long" and price <= self.trigger_price) or (
+            self.direction == "short" and price >= self.trigger_price
+        ):
+            self.triggered = True
 
-    def set_stop_loss(self, price: float) -> Tuple[float, float]:
+    @property
+    async def current_price(self) -> float:
+        if not hasattr(self, "_current_price"):
+            await self.set_current_price()
+
+        return self._current_price
+
+    async def set_current_price(self) -> None:
+        orderbook = await self.exchange.watch_order_book(self.ticker)
+        self._current_price = orderbook["bids" if self.direction == "long" else "asks"][
+            0
+        ][0]
+
+    @property
+    async def stop_loss(self) -> float:
+        if not hasattr(self, "_stop_loss"):
+            await self.set_stop_loss()
+        return self._stop_loss
+
+    async def set_stop_loss(self) -> None:
         """Calculate stoploss for order"""
 
-        if not self.stop_loss:
-            self.stop_loss = (
-                round(max(price, self.trigger.price * 1.0025), 2)
-                if self.trigger.direction == "short"
-                else round(min(price, self.trigger.price * (1 - 0.0025)), 2)
-            )
-            print(f"stoploss set to {str(self.stop_loss)}")
-            return self.stop_loss, (
-                ((self.stop_loss - self.price) / self.price)
+        price = await self.current_price
+
+        if not hasattr(self, "_stop_loss"):
+            self._stop_loss = round(
+                max(price, self.trigger_order_price * 1.0025)
                 if self.direction == "short"
-                else ((self.price - self.stop_loss) / self.price)
+                else min(price, self.trigger_order_price * (1 - 0.0025)),
+                1,
             )
 
-        temp_sl = self.stop_loss
-        match self.trigger.direction:
+        match self.direction:
             case "long":
-                if price < self.stop_loss:
-                    self.stop_loss = round(
-                        min(price, self.trigger.price * (1 - 0.0025)), 1
+                if price < self._stop_loss:
+                    self._stop_loss = round(
+                        min(price, self.trigger_order_price * (1 - 0.0025)), 1
                     )
             case "short":
-                if price > self.stop_loss:
-                    self.stop_loss = round(max(price, self.trigger.price * 1.0025), 1)
-        if temp_sl != self.stop_loss:
-            print(f"stoploss changed to {str(self.stop_loss)}")
+                if price > self._stop_loss:
+                    self._stop_loss = round(max(price, self.trigger_order_price * 1.0025), 1)
 
-        self.stop_loss_percentage: float = (
-            ((self.stop_loss - self.price) / self.price)
-            if self.direction == "short"
-            else ((self.price - self.stop_loss) / self.price)
-        )
-        return self.stop_loss, self.stop_loss_percentage
+    @property
+    async def target(self) -> float:
+        if not hasattr(self, "_target"):
+            await self.set_target()
+        return self._target
 
-    def set_take_profit(self, stop_loss_percentage: float) -> float:
-        temp_take_profit = self.take_profit if hasattr(self, "take_profit") else 0
-        self.take_profit = (
-            round((self.price * (1 + (stop_loss_percentage * 2))), 1)
+    async def set_target(self) -> None:
+        self._target = round(
+            (self.trigger_order_price * (1 + (await self.stop_loss_percentage * 2)))
             if self.direction == "long"
-            else round(self.price * (1 - (stop_loss_percentage * 2)), 1)
+            else self.trigger_order_price * (1 - (await self.stop_loss_percentage * 2)),
+            1,
         )
-        if temp_take_profit != self.take_profit:
-            print(f"take profit changed to {str(self.take_profit)}")
-        return self.take_profit
 
-    def set_size(self) -> float:
-        """TODO: Calculate ordersize"""
-        if hasattr(self, "stop_loss_percentage"):
-            match int(self.stop_loss_percentage * 10000):
-                case num if num <= 25:
-                    self.size = self.trading_size * 4
-                case num if num in range(25, 50):
-                    self.size = self.trading_size * 3
-                case num if num in range(50, 75):
-                    self.size = self.trading_size * 2
-                case num if num >= 75:
-                    self.size = self.trading_size
+    @property
+    async def amount(self) -> float:
+        if not hasattr(self, "_amount"):
+            await self.set_amount()
+
+        return self._amount
+
+    async def set_amount(self) -> None:
+        """Calculate ordersize"""
+
+        self._amount = round(
+            (1 / (await self.stop_loss_percentage * 100)) * self.trading_size, 3
+        )
+
+    @property
+    async def stop_loss_percentage(self) -> float:
+        if not hasattr(self, "_stop_loss_percentage"):
+            await self.set_stop_loss_percentage()
+        return self._stop_loss_percentage
+
+    async def set_stop_loss_percentage(self):
+        self._stop_loss_percentage = (
+            ((await self.stop_loss - self.trigger_order_price) / self.trigger_order_price)
+            if self.direction == "short"
+            else ((self.trigger_order_price - await self.stop_loss) / self.trigger_order_price)
+        )
+
+    async def create_order(self):
+        await self.set_order_variables()
+
+        if await self.stop_loss_percentage > 0.01:
+            print("stop loss is too wide, cancelling order")
+            self.finished = True
         else:
-            self.size = self.trading_size
-        return self.size
-
-    async def update_order(self, delay: int) -> None:
-        """Use calculated data to adjust order on exchange"""
-        if self.stop_loss_percentage > 0.25:
-            await self.cancel_order()
-            return
-
-        if self.order_last_update + timedelta(seconds=delay) < (now := datetime.now()):
-            order_status = await self.exchange.fetch_order_status(
-                id=self.waiting_order.get("id"), symbol=self.ticker
-            )
-            if order_status == "open":
-                await self.exchange.edit_order(
-                    id=self.waiting_order.get("id"),
+            try:
+                self.trigger_order = await self.exchange.create_order(
                     symbol=self.ticker,
                     type="market",
-                    side="buy" if self.direction == "long" else "sell",
-                    amount=self.set_size(),
+                    side="sell" if self.direction == "short" else "buy",
+                    amount=await self.amount,
                     params={
-                        "stopLoss": {"triggerPrice": self.stop_loss},
-                        "takeProfit": {"triggerPrice": self.take_profit},
+                        "positionIdx": "2" if self.direction == "short" else "1",
+                        "triggerPrice": str(self.trigger_order_price),
+                        "triggerBy": "LastPrice",
+                        "triggerDirection": "above"
+                        if self.direction == "long"
+                        else "below",
+                        "stopLoss": {"triggerPrice": str(await self.stop_loss), "tpTriggerBy": "LastPrice"},
+                        "takeProfit": {"triggerPrice": str(await self.target),  "slTriggerBy": "LastPrice"},
                     },
                 )
-                self.order_last_update = now
+                self.order_last_update = datetime.now()
+            except Exception as e:
+                print(e)
+                self.finished = True
 
-            else:
-                self.is_live = True
+    async def set_order_variables(self) -> None:
+        """Adjust order on exchange"""
+
+        await self.set_current_price()
+        await self.set_stop_loss()
+        await self.set_stop_loss_percentage()
+        await self.set_target()
+        await self.set_amount()
+
+        if self.trigger_order:
+            await self.set_order_status()
+
+    async def did_stop_loss_change(self) -> bool:
+        stop_loss_changed = False
+        current_stoploss = await self.stop_loss
+
+        if not hasattr(self, "_previous_stop_loss"):
+            stop_loss_changed = True
+        else:
+            if self._previous_stop_loss != current_stoploss:
+                stop_loss_changed = True
+
+        self._previous_stop_loss = current_stoploss
+
+        return stop_loss_changed
+
+    @property
+    async def order_status(self) -> str:
+        if not hasattr(self, "_order_status"):
+            await self.set_order_status()
+
+        return self._order_status
+
+    async def set_order_status(self) -> None:
+        try:
+            self._order_status = await self.exchange.fetch_order_status(
+                id=self.trigger_order.get("id"),
+                symbol=self.ticker,
+                params={"trigger": True},
+            )
+        except Exception as e:
+            print(e)
+            self._order_status = "not open"
+            print("order status: not open")
+
+
+    async def update_order(self) -> None:
+        """Use calculated data to adjust order on exchange"""
+
+        if await self.order_status == "open":
+            await self.exchange.edit_order(
+                id=self.trigger_order.get("id"),
+                symbol=self.ticker,
+                type="market",
+                side="buy" if self.direction == "long" else "sell",
+                amount=await self.amount,
+                params={
+                    "stopLoss": {"triggerPrice": await self.stop_loss},
+                    "takeProfit": {"triggerPrice": await self.target},
+                },
+            )
+            self.order_last_update = datetime.now()
+        else:
+            self.finished = True
 
     async def cancel_order(self) -> None:
         """If SL gets too big, cancel trade"""
 
         await self.exchange.cancel_all_orders(symbol="BTCUSDT")
-
-    def get_balance(self, balance: dict) -> dict:
-        """Calculate free USDT to use for order depending on SL"""
-
-        return balance.get("USDT", {})
